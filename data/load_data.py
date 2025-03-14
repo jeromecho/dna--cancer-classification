@@ -14,7 +14,7 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import label_binarize
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import precision_score
-from xgboost import XGBClassifier
+import xgboost as xgb
 from sklearn.metrics import precision_score
 from sklearn.metrics import precision_recall_curve, roc_curve, auc
 
@@ -174,13 +174,19 @@ N: data is still noisy with mislabele data!
 # Label encoding
 le = LabelEncoder()
 
+class_labels = {}
+
 # Iterate through columns and apply label encoding
 for column in pan_cancer_df.columns:
     if pan_cancer_df[column].dtype == 'object':
+        print(column)
         pan_cancer_df[column] = le.fit_transform(pan_cancer_df[column])
+    
+    if column == 'cancer_type':
+            class_labels = {i: label for i, label in enumerate(le.classes_)}
 
-class_labels = {i: label for i, label in enumerate(le.classes_)}
-
+print("CLASS LABELS")
+print(class_labels.values())
 
 """
 DATA ANALYSIS
@@ -232,7 +238,143 @@ X_test = sc.transform(X_test)
 """ 
 TRAINING
 """
+# Cross validation
+def cross_val(model, X_train, X_test, y_train, n_splits=5):
+  oofs = np.zeros(len(X_train))
+  preds = np.zeros(len(X_test))
 
+  target_col = pd.DataFrame(data=y_train)
+
+  folds = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+  stratified_target = pd.qcut(y_train, 10, labels=False, duplicates='drop')
+
+  for index, (trn_idx, val_idx) in enumerate(folds.split(X_train, stratified_target)):
+    print(f'\n================================ Fold {index + 1} ===================================')
+
+    cv_X_train, cv_y_train = X_train[trn_idx], target_col.iloc[trn_idx]
+    cv_X_val, cv_y_val = X_train[val_idx], target_col.iloc[val_idx]
+
+    model.fit(cv_X_train, cv_y_train)
+
+    val_preds = model.predict(cv_X_val)
+    test_preds = model.predict(X_test)
+
+    error = precision_score(cv_y_val, val_preds, average='macro')
+    print(f'Precision is : {error}')
+
+    oofs[val_idx] = val_preds
+    preds += test_preds/n_splits
+
+  total_error = precision_score(target_col, oofs, average='macro')
+  print(f'\n Precision is {total_error}')
+
+  return oofs, preds
+
+# Random Forest Classifier
+rf_classifier = RandomForestClassifier(n_estimators=10, random_state=42)
+print("--- TRAINING RANDOM FOREST ---")
+rf_classifier.fit(X_train, y_train)
+rf_oofs, rf_pred = cross_val(rf_classifier, X_train, X_test, y_train, 5)
+rf_pred = rf_pred.astype(int)
+
+# XGBoost Classifier
+xgb_classifier = xgb.XGBClassifier(objective="multi:softmax", num_class=20, n_estimators=10, random_state=42)
+
+# Cross validation
+print("--- CROSS VALIDATING XGBOOST ---")
+xgb_oofs, xgb_pred = cross_val(xgb_classifier, X_train, X_test, y_train, 5)
+
+
+"""
+METRICS
+"""
+
+# Calculate the confusion matrix
+print(len(y_test))
+print(y_test[:20])
+print(len(xgb_pred))
+xgb_pred = xgb_pred.astype(int)
+print(xgb_pred[:20])
+
+cm = confusion_matrix(y_test, xgb_pred)
+
+# Create a Seaborn heatmap for the confusion matrix
+plt.figure(figsize=(12, 6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_labels.values(), yticklabels=class_labels.values())
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.show()
+
+# ACCURACY 
+# Random Forest
+rf_accuracy = accuracy_score(y_test, rf_pred)
+print(f"Random Forest Classifier Accuracy: {rf_accuracy:.4f}")
+
+# XGBoost
+xgb_accuracy = accuracy_score(y_test, xgb_pred)
+print(f"XGBoost Classifier Accuracy: {xgb_accuracy:.4f}")
+
+# PRECISION
+# Random Forest
+rf_precision = precision_score(rf_pred, y_test, average='macro')
+print(f"Random Forest Classifier Precision: {rf_precision:.4f}")
+
+# XGBoost
+xgb_precision = precision_score(xgb_pred, y_test, average='macro')
+print(f"XGBoost Classifier Precision: {xgb_precision:.4f}")
+
+# Precision-Recall Curve
+# Binarize labels
+y_test_bin = label_binarize(y_test, classes=np.arange(20))
+
+# Classes
+class_names = list(class_labels.values())
+
+# Plot curve
+fig, axs = plt.subplots(4, 5, figsize=(12, 9))
+fig.suptitle("Precision-Recall Curves", fontsize=16)
+axs = axs.flatten()
+
+for class_label in range(20):
+  # Calculate precision/recall for current class
+  xgb_precision, xgb_recall, _ = precision_recall_curve(y_test_bin[:, class_label], xgb_classifier.predict_proba(X_test)[:, class_label])
+
+  # Plot current curve
+  axs[class_label].plot(xgb_recall, xgb_precision) #, label=f"{class_names[class_label]}", color='r')
+  axs[class_label].set_xlabel("Recall")
+  axs[class_label].set_ylabel("Precision")
+  axs[class_label].set_title(f"{class_names[class_label]}")
+  #axs[class_label].legend(loc='best')
+  axs[class_label].grid()
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
+
+# AUC/ROC Curve
+# Plot curve
+fig, axs = plt.subplots(4, 5, figsize=(18, 14))
+fig.suptitle("Precision-Recall and AUC-ROC Curves", fontsize=16)
+axs = axs.flatten()
+
+for class_label in range(20):
+    # Calculate ROC curve for current class
+    fpr, tpr, _ = roc_curve(y_test_bin[:, class_label], xgb_classifier.predict_proba(X_test)[:, class_label])
+
+    # Calculate AUC for ROC curve
+    roc_auc = auc(fpr, tpr)
+
+    # Plot Precision-Recall curve for the current class
+    axs[class_label].plot(xgb_recall, xgb_precision) #, label=f"PR Curve ({class_names[class_label]})", color='r')
+    axs[class_label].plot(fpr, tpr, label=f"AUC-ROC ({class_names[class_label]}) = {roc_auc:.2f}", color='b', linestyle='--')
+    axs[class_label].set_xlabel("False Positive Rate")
+    axs[class_label].set_ylabel("True Positive Rate")
+    axs[class_label].set_title(f"{class_names[class_label]}")
+    #axs[class_label].legend(loc='best')
+    axs[class_label].grid()
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+plt.show()
 
 """
 IMPROVEMENTS: 
